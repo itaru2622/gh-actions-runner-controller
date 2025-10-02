@@ -1,0 +1,83 @@
+ARG base=ubuntu:24.04
+FROM ${base}
+ARG base=ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update; \
+    apt-get install -y \
+    software-properties-common ca-certificates curl git git-lfs unzip zip iptables jq sudo libyaml-dev \
+    bash-completion make dumb-init
+
+# install docker
+RUN curl -L https://get.docker.com | sh
+
+# download latest scripts for runner
+RUN curl -L https://api.github.com/repos/actions/runner/releases/latest | jq -r '.assets[].browser_download_url' | grep linux-x64 | \
+    grep tar.gz | xargs -I {} curl -L {} -o /tmp/actions-runner.tgz
+RUN curl -L https://api.github.com/repos/actions/runner-container-hooks/releases/latest |  jq -r '.assets[].browser_download_url' | \
+    grep hooks-k8s | grep zip | xargs -I {} curl -L {} -o  /tmp/runner-container-hooks-k8s.zip
+
+# install gh
+RUN curl -L https://cli.github.com/packages/githubcli-archive-keyring.gpg > /etc/apt/trusted.gpg.d/github-cli.gpg ;\
+    echo "deb https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list; \
+    apt update; apt install -y gh
+
+# extract runner scripts and config.
+ARG RUNNER_ASSETS_DIR=/runnertmp
+WORKDIR ${RUNNER_ASSETS_DIR}
+
+RUN tar xzf /tmp/actions-runner.tgz; \
+    ./bin/installdependencies.sh; \
+    unzip /tmp/runner-container-hooks-k8s.zip    -d ./runner-container-hooks-k8s; \
+    rm -f /tmp/actions-runner.tgz /tmp/runner-container-hooks-*.zip
+
+# make folder for tool cache
+ARG RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+RUN mkdir -p ${RUNNER_TOOL_CACHE};
+
+# extract files regarding action-runner-controller
+COPY hooks /etc/arc/hooks/
+COPY *.sh update-status /usr/bin/
+RUN chmod +x /usr/bin/entrypoint*.sh /usr/bin/startup.sh
+
+# Runner user
+ARG RUNNER_USER_UID=1000
+RUN deluser  --remove-home --remove-all-files ubuntu; delgroup ubuntu; \
+    adduser --disabled-password --gecos "" --uid ${RUNNER_USER_UID} runner; \
+    usermod -aG sudo,docker runner ; \
+    mkdir -p /home/runner/.docker/.cache/images  /home/runner/.config /home/runner/.local/bin /home/runner/.cache; \
+    echo "%sudo   ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers ; \
+    echo "Defaults env_keep += \"DEBIAN_FRONTEND\"" >> /etc/sudoers
+
+
+RUN chown -R runner:runner /home/runner ${RUNNER_ASSETS_DIR} ${RUNNER_TOOL_CACHE}
+
+ENV HOME=/home/runner
+
+# Add the Python "User Script Directory" to the PATH
+ENV PATH="${PATH}:${HOME}/.local/bin"
+ENV ImageOS=ubuntu24
+ENV ACTIONS_RUNNER_CONTAINER_HOOKS=${RUNNER_ASSETS_DIR}/runner-container-hooks-k8s/index.js
+ENV RUNNER_ASSETS_DIR=${RUNNER_ASSETS_DIR}
+ENV RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE}
+ENV ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1
+ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/etc/arc/hooks/job-started.sh
+ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/etc/arc/hooks/job-completed.sh
+
+RUN { \
+      echo "PATH=${PATH}"; \
+      echo "ImageOS=${ImageOS}"; \
+      echo "ACTIONS_RUNNER_CONTAINER_HOOKS=${ACTIONS_RUNNER_CONTAINER_HOOKS}"; \
+      echo "RUNNER_ASSETS_DIR=${RUNNER_ASSETS_DIR}"; \
+      echo "RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE}"; \
+      echo "ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=${ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT}"; \
+      echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=${ACTIONS_RUNNER_HOOK_JOB_STARTED}"; \
+      echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=${ACTIONS_RUNNER_HOOK_JOB_COMPLETED}"; \
+    } > /etc/environment
+
+# No group definition, as that makes it harder to run docker.
+USER runner
+
+CMD ["entrypoint-dind-arc-gha.sh"]
+VOLUME /var/lib/docker
+VOLUME ${RUNNER_TOOL_CACHE}
